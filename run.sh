@@ -1,6 +1,3 @@
-TARGET="./target/debug/udp-implementation"
-TUN_NAME="tun"
-
 # Shell script to easily run the program 
 cargo build
 
@@ -10,13 +7,14 @@ if [ $? -ne 0 ]; then
 fi
 
 # Give it network capabilities
-sudo setcap cap_net_admin+ep $TARGET
+sudo setcap cap_net_admin+ep ./target/debug/udp-implementation
 
 # Run the program
-$TARGET &
+./target/debug/udp-implementation &
 pid=$!
+sleep 1
 # Add address to the tun interface
-sudo ip addr add 192.168.0.1/24 dev $TUN_NAME
-sudo ip link set up dev $TUN_NAME
+sudo ip addr add 192.168.0.1/24 dev tun
+sudo ip link set up dev tun
 trap "kill $pid" INT TERM
 wait $pid
