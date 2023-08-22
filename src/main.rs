@@ -7,6 +7,10 @@ fn main() -> io::Result<()> {
     let mut buffer = [0u8; 4096];
     let ipv4_protocol = 0x0800;
 
+    let mut ip_fragmentation_buffer = [0u8; 65535];
+    let mut fragment_ready = false;
+    let mut fragmented_packet_size = 0;
+
     loop {
         let nbytes = nic.recv(&mut buffer[..])?;
 
@@ -39,18 +43,66 @@ fn main() -> io::Result<()> {
                     header.payload_len(),
                     protocol,
                 );
-                // Get the protc ol from the IPv4 header
+
+                // Get the protcol from the IPv4 header
                 if protocol != udp_protocol {
                     continue;
                 }
 
-                // TOOD: Implement IPv4 packet handling here, validate checksum,
-                // check for fragmentation, etc
+                // Validate the checksum of the IP header
+                let ip_checksum = header.header_checksum();
+                if ip_checksum != 0 {
+                    println!("Invalid IP checksum");
+                    continue;
+                }
 
-                let ip_header_size = header.slice().len();
-                let udp_packet_start = ip_header_size + 4;
-                // Get the UDP packet and handle it
-                handle_udp_packet(&buffer[udp_packet_start..nbytes]);
+                // Handle TTL
+                let ttl = header.ttl();
+                if ttl == 0 {
+                    println!("TTL is 0");
+                    // TODO: According to RFC 791, we should send an ICMP packet back
+                    // to the sender to let them know the packet has expired
+                    continue;
+                }
+
+                // Handle fragmented packets
+                // TODO: this is wrong!
+                let is_fragmented = header.is_fragmenting_payload();
+
+                if is_fragmented {
+                    // add fragmented packets to the buffer
+                    let offset = header.fragments_offset();
+                    if offset == 0 {
+                        // This is the first fragment, we need to include the buffer in the size as well
+                        ip_fragmentation_buffer[..nbytes].copy_from_slice(&buffer[..nbytes]);
+                        fragmented_packet_size = nbytes;
+                    } else {
+                        let fragment_size = header.payload_len();
+                        let ip_header_size = header.slice().len();
+
+                        let fragment_start = ip_header_size + 4 + offset as usize;
+                        let fragment_end = fragment_start + fragment_size as usize;
+
+                        let fragment = &buffer[fragment_start..fragment_end];
+                        ip_fragmentation_buffer[fragmented_packet_size..fragment_end]
+                            .copy_from_slice(fragment);
+
+                        fragment_ready = header.more_fragments() == false;
+                        fragmented_packet_size = fragment_end;
+                    }
+                }
+
+                // Handle rest of IP protcol
+                if fragment_ready {
+                    handle_udp_packet(&ip_fragmentation_buffer[..fragmented_packet_size]);
+                    fragment_ready = false;
+                    fragmented_packet_size = 0;
+                } else if !is_fragmented {
+                    let ip_header_size = header.slice().len();
+                    let udp_packet_start = ip_header_size + 4;
+                    // Get the UDP packet and handle it
+                    handle_udp_packet(&buffer[udp_packet_start..nbytes]);
+                }
             }
             Err(e) => {
                 println!("Error: {}", e);
