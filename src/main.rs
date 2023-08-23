@@ -2,17 +2,39 @@ use etherparse::{Ipv4HeaderSlice, UdpHeaderSlice};
 use std::{collections::HashMap, io};
 use tun_tap::{Iface, Mode};
 
+const MAX_IP_PACKET_SIZE: usize = 65535;
+const BUFFER_SIZE: usize = 4096;
+const IPV4_PROTCOL: u16 = 0x0800;
+const UDP_PROTCOL: u8 = 17;
+const TUN_BYTES: usize = 4;
+const UDP_HEADER_SIZE: usize = 8;
+
 struct FragmentedPacket {
-    buffer: [u8; 65535],
+    buffer: [u8; MAX_IP_PACKET_SIZE],
     size: usize,
     is_ready: bool,
+}
+
+fn check_network_layer_packet(buffer: [u8; BUFFER_SIZE]) -> bool {
+    // By tuntap docs: https://docs.kernel.org/networking/tuntap.html
+    // the first 2 bytes are flags and the next 2 bytes are protocol
+    // let flags = u16::from_be_bytes([buffer[0], buffer[1]]);
+    let ether_protocol = u16::from_be_bytes([buffer[2], buffer[3]]);
+
+    // After that is the raw protocol(IP, IPv6, etc) frame.
+    // Ignore any non-IPv4 packets
+    // TODO: Support ipv6 as well
+    if ether_protocol != IPV4_PROTCOL {
+        return false;
+    }
+
+    return true;
 }
 
 fn main() -> io::Result<()> {
     println!("Starting TUN device...");
     let nic = Iface::new("tun", Mode::Tun).expect("Failed to create a TUN device");
-    let mut buffer = [0u8; 4096];
-    let ipv4_protocol = 0x0800;
+    let mut buffer = [0u8; BUFFER_SIZE];
 
     // Store the fragmented packet along with their identification number
     let mut fragmented_packets = HashMap::new();
@@ -20,16 +42,7 @@ fn main() -> io::Result<()> {
     loop {
         let nbytes = nic.recv(&mut buffer[..])?;
 
-        // By tuntap docs: https://docs.kernel.org/networking/tuntap.html
-        // the first 2 bytes are flags and the next 2 bytes are protocol
-        // let flags = u16::from_be_bytes([buffer[0], buffer[1]]);
-        let ether_protocol = u16::from_be_bytes([buffer[2], buffer[3]]);
-        let udp_protocol = 17;
-
-        // After that is the raw protocol(IP, IPv6, etc) frame.
-        // Ignore any non-IPv4 packets
-        // TODO: Support ipv6 as well
-        if ether_protocol != ipv4_protocol {
+        if !check_network_layer_packet(buffer) {
             continue;
         }
 
@@ -41,6 +54,7 @@ fn main() -> io::Result<()> {
                 let protocol = header.protocol();
                 let source = header.source_addr();
                 let destination = header.destination_addr();
+                let ip_header_size = header.slice().len();
 
                 println!(
                     "Packet: {} -> {}; Length: {}b Protocol: {}",
@@ -51,7 +65,7 @@ fn main() -> io::Result<()> {
                 );
 
                 // Get the protcol from the IPv4 header
-                if protocol != udp_protocol {
+                if protocol != UDP_PROTCOL {
                     continue;
                 }
 
@@ -100,13 +114,13 @@ fn main() -> io::Result<()> {
 
                     if offset == 0 {
                         // This is the first fragment, we need to include the buffer in the size as well
-                        fragmented_packet.buffer[..nbytes].copy_from_slice(&buffer[..nbytes]);
+                        let fragment_payload_start = ip_header_size + TUN_BYTES;
+                        fragmented_packet.buffer[..(nbytes - fragment_payload_start)]
+                            .copy_from_slice(&buffer[fragment_payload_start..nbytes]);
                         fragmented_packet.size = nbytes;
                     } else {
                         let fragment_payload_size = header.payload_len() as usize;
-                        let ip_header_size = header.slice().len();
-                        // TOOD: Forgot to remove udp header :(
-                        let fragment_payload_start = ip_header_size + 4;
+                        let fragment_payload_start = ip_header_size + TUN_BYTES + UDP_HEADER_SIZE;
                         let fragment_payload_end = fragment_payload_start + fragment_payload_size;
 
                         let fragment_payload =
@@ -126,8 +140,7 @@ fn main() -> io::Result<()> {
                         fragmented_packets.remove(&identification_number);
                     }
                 } else if !is_fragmented {
-                    let ip_header_size = header.slice().len();
-                    let udp_packet_start = ip_header_size + 4;
+                    let udp_packet_start = ip_header_size + TUN_BYTES;
                     // Get the UDP packet and handle it
                     handle_udp_packet(&buffer[udp_packet_start..nbytes]);
                 }
