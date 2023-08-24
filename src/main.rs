@@ -46,6 +46,11 @@ fn handle_ttl(header: &Ipv4HeaderSlice) {
 }
 
 fn validate_ip_checksum(header: &Ipv4HeaderSlice) {
+    // RFC 791 specification:
+    // The checksum field is the 16 bit one's complement of the one's
+    // complement sum of all 16 bit words in the header.  For purposes of
+    // computing the checksum, the value of the checksum field is zero.
+
     // Validate the checksum of the IP header
     // let ip_checksum = header.header_checksum();
     // if ip_checksum != 0 {
@@ -63,7 +68,7 @@ fn handle_fragmented_packet<'a>(
 ) -> &'a mut FragmentedPacket {
     println!("Got a fragmented packet: ");
     // add fragmented packets to the buffer
-    let offset = header.fragments_offset();
+    let offset = header.fragments_offset() as usize;
     let identification_number = header.identification();
 
     // Check if we already have a fragmented packet with this identification number
@@ -83,16 +88,22 @@ fn handle_fragmented_packet<'a>(
         frag.size = nbytes;
     } else {
         let payload_size = header.payload_len() as usize;
-        let payload_start_index = ip_header_size + TUN_BYTES + UDP_HEADER_SIZE;
+        let offset_index = offset * 8;
+        let payload_start_index = ip_header_size + TUN_BYTES;
         let payload_end_index = payload_start_index + payload_size;
 
-        let payload = &buffer[payload_start_index..payload_end_index];
-        let end_index = frag.size + payload_size;
+        let payload: &[u8] = &buffer[payload_start_index..payload_end_index];
 
-        frag.buffer[frag.size..end_index].copy_from_slice(payload);
+        let offset_end = offset_index + payload_size;
+
+        // Copy the payload at the correct offset
+        frag.buffer[offset_index..offset_end].copy_from_slice(payload);
 
         frag.is_ready = header.more_fragments() == false;
-        frag.size = end_index;
+
+        if frag.size < offset_end {
+            frag.size = offset_index + payload_size;
+        }
     }
 
     return frag;
