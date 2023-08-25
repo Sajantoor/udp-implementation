@@ -2,12 +2,13 @@ mod ip;
 mod udp;
 
 use etherparse::Ipv4HeaderSlice;
-use std::{collections::HashMap, io};
-
+use std::{collections::HashMap, io, sync, time};
 use tun_tap::{Iface, Mode};
 use udp::handle_udp_packet;
 
-use crate::ip::{check_and_handle_ttl, handle_fragmented_packet, is_ipv4_checksum_valid};
+use crate::ip::{
+    check_and_handle_ttl, check_expired_packets, handle_fragmented_packet, is_ipv4_checksum_valid,
+};
 
 // All hosts should be able to recieve datagrams of at least 576 bytes in length
 const BUFFER_SIZE: usize = 4096;
@@ -21,6 +22,13 @@ fn main() -> io::Result<()> {
 
     // Store the fragmented packet along with their identification number
     let mut fragmented_packets = HashMap::new();
+    let (send_expired_frags, recv_expired_frags) = sync::mpsc::channel::<u16>();
+    let (sender_current_frags, recv_curent_frags) = sync::mpsc::channel::<(u16, time::Instant)>();
+
+    let _ = std::thread::spawn(|| {
+        // use reference counter to share the fragmented_packets
+        check_expired_packets(send_expired_frags, recv_curent_frags);
+    });
 
     loop {
         let nbytes = nic.recv(&mut buffer[..])?;
@@ -67,6 +75,7 @@ fn main() -> io::Result<()> {
                         nbytes,
                         ip_header_size,
                         &mut fragmented_packets,
+                        &sender_current_frags,
                     );
 
                     if fragmented_packet.is_ready {
@@ -81,6 +90,16 @@ fn main() -> io::Result<()> {
             Err(e) => {
                 eprintln!("Error: {}", e);
             }
+        }
+
+        // Check for expired packets in the reciever channel, if there are any, remove them from the fragmented packets
+        let expired_packet = recv_expired_frags.try_recv();
+        match expired_packet {
+            Ok(identification_number) => {
+                // TOOD: Send ICMP packet back to the sender
+                fragmented_packets.remove(&identification_number);
+            }
+            Err(_) => {}
         }
     }
 }
