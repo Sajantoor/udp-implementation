@@ -1,4 +1,4 @@
-use etherparse::{Ipv4HeaderSlice, UdpHeaderSlice};
+use etherparse::{icmpv4::TimeExceededCode, Ipv4HeaderSlice, UdpHeaderSlice};
 use std::{
     collections::{hash_map::Entry, HashMap},
     io,
@@ -8,10 +8,9 @@ use tun_tap::{Iface, Mode};
 const MAX_IP_PACKET_SIZE: usize = 65535;
 // All hosts should be able to recieve datagrams of at least 576 bytes in length
 const BUFFER_SIZE: usize = 4096;
-const IPV4_PROTCOL: u16 = 0x0800;
 const UDP_PROTOCOL: u8 = 17;
-const TUN_BYTES: usize = 4;
 const UDP_HEADER_SIZE: usize = 8;
+const DEFAULT_TTL: u8 = 64;
 const FRAGMENTATION_TIMEOUT: u8 = 15; // seconds
 
 struct FragmentedPacket {
@@ -20,31 +19,47 @@ struct FragmentedPacket {
     is_ready: bool,
 }
 
-fn check_network_layer_packet(buffer: [u8; BUFFER_SIZE]) -> bool {
-    // By tuntap docs: https://docs.kernel.org/networking/tuntap.html
-    // the first 2 bytes are flags and the next 2 bytes are protocol
-    // let flags = u16::from_be_bytes([buffer[0], buffer[1]]);
-    let ether_protocol = u16::from_be_bytes([buffer[2], buffer[3]]);
-
-    // After that is the raw protocol(IP, IPv6, etc) frame.
-    // Ignore any non-IPv4 packets
-    // TODO: Support ipv6 as well
-    if ether_protocol != IPV4_PROTCOL {
-        return false;
-    }
-
-    return true;
-}
-
-fn handle_ttl(header: &Ipv4HeaderSlice) {
+fn check_and_handle_ttl(header: &Ipv4HeaderSlice, packet: &[u8], nic: &Iface) -> bool {
     let ttl = header.ttl();
     if ttl != 0 {
-        return;
+        return true;
     }
 
-    // TODO: According to RFC 791, we should send an ICMP packet back
-    // to the sender to let them know the packet has expired
-    println!("TTL is 0");
+    // Send ICMP time exceeded message back to the sender
+    //     0                   1                   2                   3
+    //     0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+    //    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    //    |     Type      |     Code      |          Checksum             |
+    //    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    //    |                             unused                            |
+    //    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    //    |      Internet Header + 64 bits of Original Data Datagram      |
+    //    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+    let source = header.source_addr().octets();
+    let destination = header.destination_addr().octets();
+
+    // 64 bits of the original data datagram therefore we need to copy the first 8 bytes
+    let data_start = header.slice().len() + UDP_HEADER_SIZE;
+    let data_end = data_start + 8;
+    let data = &packet[data_start..data_end];
+
+    let original_ip_header = header.slice();
+    let icmp_payload = [original_ip_header, data].concat();
+
+    // Send this packet back to the sender
+    eprintln!("TTL is 0, dropping packet...");
+    println!("Sending ICMP packet back to the sender...");
+
+    let packet_builder = etherparse::PacketBuilder::ipv4(destination, source, DEFAULT_TTL).icmpv4(
+        etherparse::Icmpv4Type::TimeExceeded(TimeExceededCode::TtlExceededInTransit),
+    );
+
+    let mut result = Vec::<u8>::with_capacity(packet_builder.size(icmp_payload.len()));
+    packet_builder.write(&mut result, &icmp_payload).unwrap();
+    // Send the packet
+    nic.send(&result[..]).unwrap();
+    return false;
 }
 
 fn is_ipv4_checksum_valid(header: &[u8]) -> bool {
@@ -112,13 +127,13 @@ fn handle_fragmented_packet<'a>(
 
     if offset == 0 {
         // This is the first fragment, we need to include the header in the buffer as well
-        let payload_start = ip_header_size + TUN_BYTES;
+        let payload_start = ip_header_size;
         frag.buffer[..(nbytes - payload_start)].copy_from_slice(&buffer[payload_start..nbytes]);
         frag.size = nbytes;
     } else {
         let payload_size = header.payload_len() as usize;
         let offset_index = offset * 8;
-        let payload_start_index = ip_header_size + TUN_BYTES;
+        let payload_start_index = ip_header_size;
         let payload_end_index = payload_start_index + payload_size;
 
         let payload: &[u8] = &buffer[payload_start_index..payload_end_index];
@@ -139,8 +154,9 @@ fn handle_fragmented_packet<'a>(
 }
 
 fn main() -> io::Result<()> {
-    println!("Starting TUN device...");
-    let nic = Iface::new("tun", Mode::Tun).expect("Failed to create a TUN device");
+    let nic = Iface::without_packet_info("tun", Mode::Tun).expect("Failed to create a TUN device");
+    println!("Started tun device: {:?}", nic.name());
+
     let mut buffer = [0u8; BUFFER_SIZE];
 
     // Store the fragmented packet along with their identification number
@@ -149,12 +165,8 @@ fn main() -> io::Result<()> {
     loop {
         let nbytes = nic.recv(&mut buffer[..])?;
 
-        if !check_network_layer_packet(buffer) {
-            continue;
-        }
-
         // We've got an IPv4 packet, need to find the protocol and make sure its UDP
-        let ip_header = Ipv4HeaderSlice::from_slice(&buffer[TUN_BYTES..nbytes]);
+        let ip_header = Ipv4HeaderSlice::from_slice(&buffer[..nbytes]);
 
         match ip_header {
             Ok(header) => {
@@ -177,11 +189,13 @@ fn main() -> io::Result<()> {
                 }
 
                 if !is_ipv4_checksum_valid(header.slice()) {
-                    println!("Invalid IPv4 checksum, dropping packet...");
+                    eprintln!("Invalid IPv4 checksum, dropping packet...");
                     continue;
                 }
 
-                handle_ttl(&header);
+                if !check_and_handle_ttl(&header, &buffer[..nbytes], &nic) {
+                    continue;
+                }
                 // Handle fragmented packets
                 let is_fragmented = header.is_fragmenting_payload();
 
@@ -200,11 +214,11 @@ fn main() -> io::Result<()> {
                         fragmented_packets.remove(&header.identification());
                     }
                 } else {
-                    handle_udp_packet(&buffer[TUN_BYTES..nbytes], ip_header_size);
+                    handle_udp_packet(&buffer[..nbytes], ip_header_size);
                 }
             }
             Err(e) => {
-                println!("Error: {}", e);
+                eprintln!("Error: {}", e);
             }
         }
     }
