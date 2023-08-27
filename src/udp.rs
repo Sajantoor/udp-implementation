@@ -1,14 +1,35 @@
-use etherparse::UdpHeaderSlice;
+use std::{io, net::Ipv4Addr, sync::mpsc};
 
+use etherparse::{Ipv4HeaderSlice, PacketBuilder, UdpHeaderSlice};
+use tun_tap::Iface;
+
+use crate::{ip::DEFAULT_TTL, IpPort};
+
+#[derive(Clone)]
+pub struct UdpPacket {
+    pub data: Box<[u8]>,
+    pub source_ip: Ipv4Addr,
+    pub source_port: u16,
+    pub(crate) destination_ip: Ipv4Addr,
+    pub(crate) destination_port: u16,
+}
+
+/// UDP header is 8 bytes
 pub(crate) const UDP_HEADER_SIZE: usize = 8;
 
+/// Determine if the UDP checksum is valid, returns true if valid, false otherwise
+///
+/// RFC 768 specification for UDP checksum:
+/// Checksum is the 16-bit one's complement of the one's complement sum of a
+/// pseudo header of information from the IP header, the UDP header, and the
+/// data,  padded  with zero octets  at the end (if  necessary)  to  make  a
+/// multiple of two octets.
+///
+/// # Arguments
+///
+/// * `header` - The packet header as a byte slice
+/// * `ip_header_size` - The size of the IP header
 fn is_udp_checksum_valid(header: &[u8], ip_header_size: usize) -> bool {
-    // RFC 768 specification for UDP checksum:
-    // Checksum is the 16-bit one's complement of the one's complement sum of a
-    // pseudo header of information from the IP header, the UDP header, and the
-    // data,  padded  with zero octets  at the end (if  necessary)  to  make  a
-    // multiple of two octets.
-
     let mut checksum: u32 = 0;
 
     // Calculate checksum for the pseudo header which is part of the IP header
@@ -46,7 +67,7 @@ fn is_udp_checksum_valid(header: &[u8], ip_header_size: usize) -> bool {
     // UDP Length
     checksum = checksum.wrapping_add(u32::from(u16::from_be_bytes([header[24], header[25]])));
 
-    // Calculate checksum for the UDP header and data
+    // Calculate checksum for the UDP header and data, UDP header is after the IP header
     let udp_packet = &header[ip_header_size..];
 
     // Iterate over 16-bit words in the header
@@ -75,57 +96,72 @@ fn is_udp_checksum_valid(header: &[u8], ip_header_size: usize) -> bool {
     return checksum == 0;
 }
 
-pub(crate) fn handle_udp_packet(packet: &[u8], ip_header_size: usize) {
+/// Handle a UDP packet
+/// # Arguments
+/// * `packet` - The packet as a byte slice starting from the IP header
+/// * `ip_header_size` - The size of the IP header
+pub(crate) fn handle_udp_packet(
+    packet: &[u8],
+    ip_header_size: usize,
+    udp_packet_sender: &mpsc::Sender<UdpPacket>,
+) {
     // UDP header is 8 bytes
-    let header =
+    let udp_header =
         match UdpHeaderSlice::from_slice(&packet[ip_header_size..ip_header_size + UDP_HEADER_SIZE])
         {
             Err(e) => {
-                println!("Got bad UDP packet: {}", e);
+                eprintln!("Got bad UDP packet: {}", e);
                 return;
             }
 
             Ok(h) => h,
         };
 
-    // RFC 768 specification of UDP header
-    // 0      7 8     15 16    23 24    31
-    // +--------+--------+--------+--------+
-    // |     Source      |   Destination   |
-    // |      Port       |      Port       |
-    // +--------+--------+--------+--------+
-    // |                 |                 |
-    // |     Length      |    Checksum     |
-    // +--------+--------+--------+--------+
-    // |
-    // |          data octets ...
-    // +---------------- ...
-
     if !is_udp_checksum_valid(&packet, ip_header_size) {
-        println!("Invalid UDP checksum, dropping packet...");
+        eprintln!("Invalid UDP checksum, dropping packet...");
         return;
     }
 
-    let udp_length = header.length();
-    let source_port = header.source_port();
-    let destination_port = header.destination_port();
-
-    println!(
-        "UDP Packet: {} -> {}; Length: {}b",
-        source_port, destination_port, udp_length
-    );
-
-    // Read the data from the packet
-    let data = &packet[ip_header_size + UDP_HEADER_SIZE..];
-
-    // Parse the data as a string
-    let data_string = match std::str::from_utf8(data) {
-        Ok(v) => v,
+    let ip_header = match Ipv4HeaderSlice::from_slice(&packet[..ip_header_size]) {
+        Ok(header) => header,
         Err(e) => {
-            println!("Invalid UTF-8 sequence: {}", e);
+            eprintln!("Invalid IPv4 header: {}", e);
             return;
         }
     };
 
-    println!("Data: {}", data_string);
+    let source_ip = ip_header.source_addr();
+    let destination_ip = ip_header.destination_addr();
+
+    let source_port = udp_header.source_port();
+    let destination_port = udp_header.destination_port();
+
+    // Read the data from the packet
+    let data = &packet[ip_header_size + UDP_HEADER_SIZE..];
+
+    // Send the data to the main thread
+    let _ = udp_packet_sender.send(UdpPacket {
+        data: data.to_vec().into_boxed_slice(),
+        source_ip,
+        source_port,
+        destination_ip,
+        destination_port,
+    });
+}
+
+pub(crate) fn send_udp_packet(
+    nic: &Iface,
+    destination: IpPort,
+    source: IpPort,
+    payload: &[u8],
+) -> io::Result<usize> {
+    let packet_builder =
+        PacketBuilder::ipv4(source.ip.octets(), destination.ip.octets(), DEFAULT_TTL)
+            .udp(source.port, destination.port);
+
+    let mut result = Vec::<u8>::with_capacity(packet_builder.size(payload.len()));
+    packet_builder.write(&mut result, &payload).unwrap();
+
+    // Send the packet
+    return nic.send(&result[..]);
 }

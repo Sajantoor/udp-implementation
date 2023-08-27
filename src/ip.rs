@@ -7,10 +7,12 @@ use etherparse::{icmpv4::TimeExceededCode, Ipv4HeaderSlice};
 use tun_tap::Iface;
 
 use crate::udp::UDP_HEADER_SIZE;
-const DEFAULT_TTL: u8 = 64;
+pub(crate) const DEFAULT_TTL: u8 = 64;
 
+/// Maximum size of an IP packet according to RFC 791
 const MAX_IP_PACKET_SIZE: usize = 65535;
-const FRAGMENTATION_TIMEOUT: u64 = 15; // seconds
+/// Fragmentation timeout in seconds
+const FRAGMENTATION_TIMEOUT: u64 = 15;
 
 pub(crate) struct FragmentedPacket {
     pub(crate) buffer: [u8; MAX_IP_PACKET_SIZE],
@@ -19,6 +21,13 @@ pub(crate) struct FragmentedPacket {
     pub(crate) last_updated: time::Instant,
 }
 
+/// Check for expired packets and send them to the sender channel, if they are expired.
+/// Checks if the last updated time is greater than the fragmentation timeout.
+///
+/// # Arguments
+///
+/// * `sender_channel` - The channel to send the expired packets to
+/// * `recv_channel` - The channel to receive the last updated time and identification number
 pub(crate) fn check_expired_packets(
     sender_channel: sync::mpsc::Sender<u16>,
     recv_channel: sync::mpsc::Receiver<(u16, time::Instant)>,
@@ -51,6 +60,18 @@ pub(crate) fn check_expired_packets(
     }
 }
 
+/// Check if the TTL is 0, if it is, then send an ICMP packet back to the sender
+/// and return false, otherwise return true
+///
+/// # Arguments
+///
+/// * `header` - The IPv4 header
+/// * `packet` - The packet as a byte slice
+/// * `nic` - The network interface
+///
+/// # Returns
+///     
+/// True if the TTL is not 0, false otherwise
 pub(crate) fn check_and_handle_ttl(header: &Ipv4HeaderSlice, packet: &[u8], nic: &Iface) -> bool {
     let ttl = header.ttl();
     if ttl != 0 {
@@ -81,7 +102,6 @@ pub(crate) fn check_and_handle_ttl(header: &Ipv4HeaderSlice, packet: &[u8], nic:
 
     // Send this packet back to the sender
     eprintln!("TTL is 0, dropping packet...");
-    println!("Sending ICMP packet back to the sender...");
 
     let packet_builder = etherparse::PacketBuilder::ipv4(destination, source, DEFAULT_TTL).icmpv4(
         etherparse::Icmpv4Type::TimeExceeded(TimeExceededCode::TtlExceededInTransit),
@@ -94,6 +114,22 @@ pub(crate) fn check_and_handle_ttl(header: &Ipv4HeaderSlice, packet: &[u8], nic:
     return false;
 }
 
+/// Handle fragmented packets, assumes the packet has already been checked if it is fragmented.
+/// Sends the fragmented packets to the sender channel.
+/// Reassembles the fragmented packet and returns a reference to the packet.
+///
+/// # Arguments
+///
+/// * `header` - The IPv4 header
+/// * `buffer` - The packet as a byte slice
+/// * `nbytes` - The number of bytes in the packet
+/// * `ip_header_size` - The size of the IP header
+/// * `fragmented_packets` - The map of fragmented packets
+/// * `sender_channel` - The channel to send the fragmented packets to
+///
+/// # Returns
+///
+/// A reference to the fragmented packet
 pub(crate) fn handle_fragmented_packet<'a>(
     header: &'a Ipv4HeaderSlice<'a>,
     buffer: &'a [u8],
@@ -153,24 +189,26 @@ pub(crate) fn handle_fragmented_packet<'a>(
     return frag;
 }
 
+/// Check if the checksum is valid
+///
+// RFC 791 specification:
+// The checksum field is the 16 bit one's complement of the one's
+// complement sum of all 16 bit words in the header.  For purposes of
+// computing the checksum, the value of the checksum field is zero.
+///
+/// # Arguments
+///
+///
+///  * `header` - The packet header as a byte slice
+///
+/// # Returns
+///
+/// True if the checksum is valid, false otherwise
 pub(crate) fn is_ipv4_checksum_valid(header: &[u8]) -> bool {
     // RFC 791 specification:
     // The checksum field is the 16 bit one's complement of the one's
     // complement sum of all 16 bit words in the header.  For purposes of
     // computing the checksum, the value of the checksum field is zero.
-
-    // 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-    // |Ver= 4 |IHL= 5 |Type of Service|        Total Length = 21      |
-    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-    // |      Identification = 111     |Flg=0|   Fragment Offset = 0   |
-    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-    // |   Time = 123  |  Protocol = 1 |        header checksum        |
-    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-    // |                         source address                        |
-    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-    // |                      destination address                      |
-    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 
     let mut checksum: u32 = 0;
 
