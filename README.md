@@ -1,6 +1,7 @@
 # Low Level UDP Implementation in Rust
 
-Implementation of a low level UDP and IPv4 protocols in Rust using tun/tap devices.
+Low level implementation of UDP and IPv4 protocols in Rust using tun/tap devices.
+This only works on Linux. This is a learning project, not intended for any real world use. 
 
 ## Setup
 
