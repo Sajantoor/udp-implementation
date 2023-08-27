@@ -1,4 +1,4 @@
-use std::{io, net::Ipv4Addr, sync::mpsc};
+use std::{fmt, io, net::Ipv4Addr, sync::mpsc};
 
 use etherparse::{Ipv4HeaderSlice, PacketBuilder, UdpHeaderSlice};
 use tun_tap::Iface;
@@ -12,6 +12,16 @@ pub struct UdpPacket {
     pub source_port: u16,
     pub(crate) destination_ip: Ipv4Addr,
     pub(crate) destination_port: u16,
+}
+
+impl fmt::Display for UdpPacket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "({}:{} -> {}:{}: Sent: {:?})",
+            self.source_ip, self.source_port, self.destination_ip, self.destination_port, self.data
+        )
+    }
 }
 
 /// UDP header is 8 bytes
